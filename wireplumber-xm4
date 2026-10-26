@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# The internal Bluetooth SPA ABI is tied to this exact PipeWire release.
+# After a system upgrade, use the packaged driver until this one is rebuilt.
+driver_dir="$HOME/.local/lib/sony-wh1000xm4/pipewire-1.6.8/spa-0.2"
+if [[ "$(pkg-config --modversion libpipewire-0.3 2>/dev/null || true)" == 1.6.8 &&
+      -r "$driver_dir/bluez5/libspa-bluez5.so" &&
+      -r "$driver_dir/bluez5/libspa-codec-bluez5-sbc.so" ]]; then
+    export SPA_PLUGIN_DIR="$driver_dir:${SPA_PLUGIN_DIR:-/usr/lib/spa-0.2}"
+fi
+exec /usr/bin/wireplumber "$@"

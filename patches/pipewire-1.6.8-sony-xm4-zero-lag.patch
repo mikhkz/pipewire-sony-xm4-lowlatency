@@ -1,0 +1,682 @@
+--- vendor/pipewire-1.6.8/spa/plugins/bluez5/media-sink.c	2026-07-09 15:25:35.000000000 +0500
++++ src/media-sink.c	2026-10-26 14:08:23.610265200 +0500
+@@ -32,6 +32,7 @@
+ #include <spa/debug/log.h>
+ 
+ #include <bluetooth/bluetooth.h>
++#include <bluetooth/hci.h>
+ 
+ #include <sbc/sbc.h>
+ 
+@@ -55,12 +56,16 @@
+ };
+ 
+ #define FILL_FRAMES 4
++#define A2DP_FILL_FRAMES 2
+ #define MIN_BUFFERS 3
+ #define MAX_BUFFERS 32
+ #define BUFFER_SIZE	(8192*8)
+ #define RATE_CTL_DIFF_MAX 0.01
+ #define LATENCY_PERIOD		(200 * SPA_NSEC_PER_MSEC)
+ 
++#define A2DP_SKB_TRUESIZE_BYTES		2304u
++#define A2DP_MAX_OUTQ_PACKETS		2u
++
+ /* Wait for two cycles before trying to sync ISO. On start/driver reassign,
+  * first cycle may have strange number of samples. */
+ #define RESYNC_CYCLES 2
+@@ -213,6 +218,19 @@
+ 	struct spa_list asha_link;
+ 
+ 	struct spa_bt_latency tx_latency;
++
++	bool rf_stall_active;
++	uint32_t stall_drop_count;
++	uint32_t stall_peak_packets;
++	int stall_peak_outq;
++	uint32_t congested_ticks;
++	uint32_t hw_acl_pkts;
++	uint32_t resync_drain_packets;
++	uint32_t last_packet_samples;
++	uint32_t last_packet_bytes;
++	uint32_t skb_truesize;
++	int prev_outq_bytes;
++	uint64_t last_trim_time;
+ };
+ 
+ #define CHECK_PORT(this,d,p)	((d) == SPA_DIRECTION_INPUT && (p) == 0)
+@@ -589,6 +607,31 @@
+ 	return 0;
+ }
+ 
++static uint32_t get_ready_list_frames(struct impl *this)
++{
++	struct port *port = &this->port;
++	uint32_t bytes = 0;
++	struct buffer *b;
++
++	if (port->frame_size == 0)
++		return 0;
++
++	spa_list_for_each(b, &port->ready, link) {
++		struct spa_data *d = b->buf->datas;
++
++		bytes += d[0].chunk->size;
++	}
++
++	if (bytes > port->ready_offset)
++		bytes -= port->ready_offset;
++	else
++		bytes = 0;
++
++	bytes += this->silence_frames * this->block_size;
++
++	return bytes / port->frame_size;
++}
++
+ static uint32_t get_queued_frames(struct impl *this)
+ {
+ 	struct port *port = &this->port;
+@@ -682,6 +725,36 @@
+ 	return 0;
+ }
+ 
++static uint32_t discard_current_packet(struct impl *this, uint32_t target_samples)
++{
++	struct port *port = &this->port;
++	uint32_t block_samples = 0;
++	uint32_t consumed_samples = 0;
++
++	if (port->frame_size > 0 && (this->block_count > 0 || this->tmp_buffer_used > 0)) {
++		block_samples = (this->block_count * this->block_size) / port->frame_size;
++		consumed_samples = (this->block_count * this->block_size + this->tmp_buffer_used)
++			/ port->frame_size;
++		this->tmp_buffer_used = 0;
++	}
++
++	/* Rewind seqnum and sample_count so reset_buffer() re-uses the exact
++	 * sequence number and RTP timestamp for the next transmitted packet. */
++	this->seqnum--;
++	if (this->sample_count >= block_samples)
++		this->sample_count -= block_samples;
++	else
++		this->sample_count = 0;
++
++	reset_buffer(this);
++
++	if (consumed_samples < target_samples) {
++		drop_frames(this, target_samples - consumed_samples);
++		return target_samples;
++	}
++	return consumed_samples;
++}
++
+ static int setup_matching(struct impl *this)
+ {
+ 	struct port *port = &this->port;
+@@ -705,24 +778,46 @@
+ 	return 0;
+ }
+ 
++static int get_socket_outq_bytes(struct impl *this)
++{
++	int value = 0;
++
++	if (this->flush_source.fd < 0)
++		return -1;
++	if (ioctl(this->flush_source.fd, TIOCOUTQ, &value) < 0)
++		return -errno;
++	/*
++	 * Kernel quirk: net/bluetooth/af_bluetooth.c:bt_sock_ioctl(TIOCOUTQ)
++	 * returns sock_wspace(sk) = (sk_sndbuf - sk_wmem_alloc) (i.e. FREE space!),
++	 * whereas AF_UNIX (used in unit tests) returns sk_wmem_alloc (USED bytes).
++	 * On real Bluetooth transports (this->transport->fd >= 0), convert free space
++	 * into actual queued bytes: fd_buffer_size - value.
++	 */
++	if (this->transport && this->transport->fd >= 0 && this->fd_buffer_size > 0) {
++		if ((uint32_t)value <= this->fd_buffer_size)
++			value = (int)this->fd_buffer_size - value;
++		else
++			value = 0;
++	}
++	return value >= 0 ? value : 0;
++}
++
+ static int get_transport_unsent_size(struct impl *this)
+ {
+-	int res, value;
++	int outq = 0, value = 0;
+ 
+-	if (this->tx_latency.enabled) {
+-		res = 0;
+-		value = this->tx_latency.unsent;
+-	} else if (this->codec->kind == MEDIA_CODEC_HFP) {
+-		value = 0;
++	if (this->codec->kind == MEDIA_CODEC_HFP)
++		return 0;
++
++	outq = get_socket_outq_bytes(this);
++	if (this->tx_latency.enabled && this->tx_latency.have_completion) {
++		value = (int)this->tx_latency.unsent;
++		if (outq > value)
++			value = outq;
++	} else if (outq >= 0) {
++		value = outq;
+ 	} else {
+-		res = ioctl(this->flush_source.fd, TIOCOUTQ, &value);
+-		if (res < 0) {
+-			spa_log_error(this->log, "%p: ioctl fail: %m", this);
+-			return -errno;
+-		}
+-		if ((unsigned int)value > this->fd_buffer_size)
+-			return -EIO;
+-		value = this->fd_buffer_size - value;
++		return outq;
+ 	}
+ 
+ 	spa_log_trace(this->log, "%p: fd unsent size:%d/%d", this, value, this->fd_buffer_size);
+@@ -742,12 +837,11 @@
+ 
+ 	spa_system_clock_gettime(this->data_system, CLOCK_REALTIME, &ts_pre);
+ 
+-	if (this->codec->kind == MEDIA_CODEC_HFP) {
++	if (this->codec->kind == MEDIA_CODEC_HFP)
+ 		written = spa_bt_sco_io_write(this->transport->sco_io, this->buffer, this->buffer_used);
+-	} else {
++	else
+ 		written = spa_bt_send(this->flush_source.fd, this->buffer, this->buffer_used,
+ 				&this->tx_latency, SPA_TIMESPEC_TO_NSEC(&ts_pre));
+-	}
+ 
+ 	if (SPA_UNLIKELY(spa_log_level_topic_enabled(this->log, SPA_LOG_TOPIC_DEFAULT, SPA_LOG_LEVEL_TRACE))) {
+ 		struct timespec ts;
+@@ -906,6 +1000,7 @@
+ 	struct port *port = &this->port;
+ 	bool is_asha = this->codec->kind == MEDIA_CODEC_ASHA;
+ 	bool is_sco = this->codec->kind == MEDIA_CODEC_HFP;
++	bool is_a2dp = (!this->transport->iso_io && !is_asha && !is_sco);
+ 	uint32_t total_frames;
+ 	int written;
+ 	int unsent_buffer;
+@@ -1043,21 +1138,6 @@
+ 		struct spa_bt_asha *asha = this->asha;
+ 
+ 		if (this->need_flush && !asha->flush_pending) {
+-			/*
+-			 * For ASHA, we cannot send more than one encoded
+-			 * packet at a time and can only send them spaced
+-			 * 20 ms apart which is the ASHA connection interval.
+-			 * All encoded packets will be 160 bytes + 1 byte
+-			 * sequence number.
+-			 *
+-			 * Unlike the A2DP flow below, we cannot delay the
+-			 * output by 1 packet. While that might work for the
+-			 * mono case, for stereo that make the two sides be
+-			 * out of sync with each other and if the two sides
+-			 * differ by more than 3 credits, we would have to
+-			 * drop packets or the devices themselves might drop
+-			 * the connection.
+-			 */
+ 			memcpy(asha->buf, this->buffer, this->buffer_used);
+ 			asha->flush_pending = true;
+ 			reset_buffer(this);
+@@ -1071,6 +1151,60 @@
+ 		return 0;
+ 	}
+ 
++	if (is_a2dp && port->current_format.info.raw.rate > 0 && this->need_flush) {
++		uint32_t rate = port->current_format.info.raw.rate;
++		struct timespec ts_rt, ts_mono;
++		uint64_t now_rt, now_mono, pkt_time;
++		uint32_t pkt_samples, ready_rem;
++		int outq_bytes;
++		int max_outq_bytes = (int)(A2DP_MAX_OUTQ_PACKETS * A2DP_SKB_TRUESIZE_BYTES);
++
++		spa_system_clock_gettime(this->data_system, CLOCK_REALTIME, &ts_rt);
++		spa_system_clock_gettime(this->data_system, CLOCK_MONOTONIC, &ts_mono);
++		now_rt = SPA_TIMESPEC_TO_NSEC(&ts_rt);
++		now_mono = SPA_TIMESPEC_TO_NSEC(&ts_mono);
++
++		if (this->tx_latency.enabled)
++			spa_bt_latency_recv_errqueue(&this->tx_latency, this->flush_source.fd,
++					now_rt, this->log);
++
++		outq_bytes = get_socket_outq_bytes(this);
++
++		pkt_samples = this->block_count > 0
++			? (this->block_count * this->block_size) / port->frame_size
++			: (this->last_packet_samples > 0
++				? this->last_packet_samples
++				: SPA_MAX(this->block_size / port->frame_size, 256u));
++		pkt_time = (uint64_t)pkt_samples * SPA_NSEC_PER_SEC / rate;
++		if (pkt_time == 0)
++			pkt_time = 10 * SPA_NSEC_PER_MSEC;
++
++		/* On Linux Bluetooth L2CAP, TIOCOUTQ > 0 only occurs when all hardware
++		 * controller ACL slots (hdev->acl_cnt) are already 100% full.
++		 * If >= 2 full packets are sitting unaccepted in the kernel socket queue
++		 * and the queue has not drained since the previous packet interval,
++		 * the RF link is stalled: drop this packet in-place without advancing
++		 * RTP seqnum/timestamp so socket buffers never bloat. */
++		if (outq_bytes >= max_outq_bytes && outq_bytes >= this->prev_outq_bytes) {
++			this->congested_ticks++;
++		} else if (outq_bytes <= 0 || outq_bytes < this->prev_outq_bytes) {
++			this->congested_ticks = 0;
++		}
++		this->prev_outq_bytes = outq_bytes > 0 ? outq_bytes : 0;
++
++		if (this->congested_ticks >= 2u) {
++			this->rf_stall_active = true;
++			this->stall_drop_count++;
++			discard_current_packet(this, pkt_samples);
++			ready_rem = get_ready_list_frames(this);
++			if (ready_rem > pkt_samples)
++				drop_frames(this, ready_rem - pkt_samples);
++			this->next_flush_time = now_mono + pkt_time;
++			enable_flush_timer(this, true);
++			goto again;
++		}
++	}
++
+ 	/*
+ 	 * Get packet queue size before writing to it. This should be zero to increase
+ 	 * bitpool. Bitpool shouldn't be increased when there is unsent data.
+@@ -1091,6 +1225,32 @@
+ 			this->last_error = now_time;
+ 		}
+ 
++		if (is_a2dp) {
++			struct timespec ts_mono;
++			uint64_t now_mono, pkt_time;
++			uint32_t pkt_samples = (this->block_count * this->block_size) / port->frame_size;
++			uint32_t ready_rem;
++
++			if (pkt_samples == 0)
++				pkt_samples = this->last_packet_samples ? this->last_packet_samples : 256u;
++			pkt_time = (uint64_t)pkt_samples * SPA_NSEC_PER_SEC
++				/ port->current_format.info.raw.rate;
++
++			spa_system_clock_gettime(this->data_system, CLOCK_MONOTONIC, &ts_mono);
++			now_mono = SPA_TIMESPEC_TO_NSEC(&ts_mono);
++
++			this->rf_stall_active = true;
++			this->stall_drop_count++;
++
++			discard_current_packet(this, pkt_samples);
++			ready_rem = get_ready_list_frames(this);
++			if (ready_rem > pkt_samples)
++				drop_frames(this, ready_rem - pkt_samples);
++			this->next_flush_time = now_mono + pkt_time;
++			enable_flush_timer(this, true);
++			goto again;
++		}
++
+ 		/*
+ 		 * The socket buffer is full, and the device is not processing data
+ 		 * fast enough, so should just skip this packet. There will be a sound
+@@ -1117,6 +1277,19 @@
+ 		uint64_t packet_time = (uint64_t)packet_samples * SPA_NSEC_PER_SEC
+ 			/ port->current_format.info.raw.rate;
+ 
++		if (packet_samples > 0)
++			this->last_packet_samples = packet_samples;
++		this->last_packet_bytes = (uint32_t)written;
++
++		if (is_a2dp && this->rf_stall_active) {
++			uint32_t ready_rem = get_ready_list_frames(this);
++			if (ready_rem > packet_samples)
++				drop_frames(this, ready_rem - packet_samples);
++			this->rf_stall_active = false;
++			this->stall_drop_count = 0;
++			this->congested_ticks = 0;
++		}
++
+ 		if (SPA_LIKELY(this->position)) {
+ 			uint64_t duration_ns;
+ 
+@@ -1126,16 +1299,6 @@
+ 			this->next_flush_time = get_reference_time(this, &duration_ns)
+ 				+ packet_time;
+ 
+-			/*
+-			 * We can delay the output by one packet to avoid waiting
+-			 * for the next buffer and so make send intervals exactly regular.
+-			 * However, this is not needed for A2DP or BAP. The controller
+-			 * will do the scheduling for us, and there's also the socket buffer
+-			 * in between.
+-			 *
+-			 * Although in principle this should not be needed, we
+-			 * do it regardless in case it helps.
+-			 */
+ #if 1
+ 			this->next_flush_time += SPA_MIN(packet_time,
+ 					duration_ns * (SPA_MAX(port->n_buffers, 2u) - 2));
+@@ -1622,6 +1785,32 @@
+ 	this->update_delay_event = spa_loop_utils_add_event(this->loop_utils, update_delay_event, this);
+ 
+ 	spa_zero(this->tx_latency);
++	this->rf_stall_active = false;
++	this->stall_drop_count = 0;
++	this->stall_peak_packets = 0;
++	this->stall_peak_outq = 0;
++	this->congested_ticks = 0;
++	this->hw_acl_pkts = 0;
++	if (!this->transport->iso_io && !is_asha && !is_sco) {
++		int hci_fd = socket(AF_BLUETOOTH, SOCK_RAW | SOCK_CLOEXEC, BTPROTO_HCI);
++		this->hw_acl_pkts = 4u;
++		if (hci_fd >= 0) {
++			struct hci_dev_info di = { .dev_id = 0 };
++			if (ioctl(hci_fd, HCIGETDEVINFO, &di) == 0 && di.acl_pkts > 0)
++				this->hw_acl_pkts = SPA_CLAMP((uint32_t)di.acl_pkts, 2u, 8u);
++			close(hci_fd);
++		}
++		spa_log_info(this->log, "%p: A2DP low-latency guard active (SO_SNDBUF=%u, hw_acl_pkts=%u)",
++				this, this->fd_buffer_size, this->hw_acl_pkts);
++	}
++	this->resync_drain_packets = 0;
++	this->last_packet_samples = port->frame_size > 0
++		? SPA_MAX(this->block_size / port->frame_size, 256u)
++		: 256u;
++	this->last_packet_bytes = 0;
++	this->skb_truesize = 0;
++	this->prev_outq_bytes = 0;
++	this->last_trim_time = 0;
+ 
+ 	if (is_sco) {
+ 		int res;
+@@ -2472,14 +2661,16 @@
+ 		 * the transport, we won't get a write error, but instead see a transport
+ 		 * state change.
+ 		 *
+-		 * Treat this as a transport error, so that upper levels don't try to
+-		 * retry too often.
++		 * Release the transport immediately so a replacement node created by
++		 * WirePlumber on SPA_NODE_EVENT_Error can cleanly re-acquire it.
+ 		 */
+ 
+ 		spa_log_debug(this->log, "%p: transport %p becomes inactive: stop and indicate error",
+ 				this, this->transport);
+ 
+-		spa_bt_transport_set_state(this->transport, SPA_BT_TRANSPORT_STATE_ERROR);
++		do_stop(this);
++		if (this->transport)
++			spa_bt_transport_set_state(this->transport, SPA_BT_TRANSPORT_STATE_ERROR);
+ 		return;
+ 	}
+ 
+--- vendor/pipewire-1.6.8/spa/plugins/bluez5/a2dp-codec-sbc.c	2026-07-09 15:25:35.000000000 +0500
++++ src/a2dp-codec-sbc.c	2026-10-26 10:53:35.928610400 +0500
+@@ -8,6 +8,8 @@
+ #include <arpa/inet.h>
+ 
+ #include <spa/param/audio/format.h>
++#include <spa/param/props.h>
++#include <spa/pod/parser.h>
+ #include <spa/utils/string.h>
+ 
+ #include <sbc/sbc.h>
+@@ -17,6 +19,105 @@
+ 
+ #define MAX_FRAME_COUNT 16
+ 
++/* A device-scoped opt-in. Zero preserves upstream MTU-sized packets. */
++#define PACKET_FRAMES_KEY "bluez5.a2dp.sbc.packet-frames"
++#define PACKET_TIME_KEY "bluez5.a2dp.sbc.packet-time-us"
++
++struct sbc_packet_props {
++	uint32_t packet_frames;
++	uint32_t packet_time_us;
++};
++
++static void *codec_init_props(const struct media_codec *codec, uint32_t flags,
++		const struct spa_dict *settings)
++{
++	struct sbc_packet_props *props = calloc(1, sizeof(*props));
++	const char *value;
++	uint32_t frames;
++
++	if (props == NULL)
++		return NULL;
++	value = settings ? spa_dict_lookup(settings, PACKET_FRAMES_KEY) : NULL;
++	if (value != NULL && spa_atou32(value, &frames, 10) && frames <= 15)
++		props->packet_frames = frames;
++	value = settings ? spa_dict_lookup(settings, PACKET_TIME_KEY) : NULL;
++	if (value != NULL && spa_atou32(value, &frames, 10) &&
++			(frames == 0 || (frames >= 1000 && frames <= 40000)))
++		props->packet_time_us = frames;
++	return props;
++}
++
++static int codec_enum_props(void *data, const struct spa_dict *settings,
++		uint32_t id, uint32_t idx, struct spa_pod_builder *builder,
++		struct spa_pod **param)
++{
++	const struct sbc_packet_props *props = data;
++	struct spa_pod_frame frames[2];
++
++	if (idx != 0 || id != SPA_PARAM_Props)
++		return 0;
++	spa_pod_builder_push_object(builder, &frames[0], SPA_TYPE_OBJECT_Props, id);
++	spa_pod_builder_prop(builder, SPA_PROP_params, 0);
++	spa_pod_builder_push_struct(builder, &frames[1]);
++	spa_pod_builder_string(builder, PACKET_FRAMES_KEY);
++	spa_pod_builder_int(builder, props->packet_frames);
++	spa_pod_builder_string(builder, PACKET_TIME_KEY);
++	spa_pod_builder_int(builder, props->packet_time_us);
++	spa_pod_builder_pop(builder, &frames[1]);
++	*param = spa_pod_builder_pop(builder, &frames[0]);
++	return *param != NULL ? 1 : -ENOSPC;
++}
++
++/* Validate the whole update before publishing it. The audio thread applies
++ * it only when opening the next packet, never to a packet already encoded. */
++static int codec_set_props(void *data, const struct spa_pod *param)
++{
++	struct sbc_packet_props *props = data, next = *props;
++	const struct spa_pod *parameters = NULL;
++	struct spa_pod_parser parser;
++	struct spa_pod_frame frame;
++
++	if (param == NULL) {
++		memset(&next, 0, sizeof(next));
++	} else {
++		if (spa_pod_parse_object(param, SPA_TYPE_OBJECT_Props, NULL,
++				SPA_PROP_params, SPA_POD_OPT_Pod(&parameters)) < 0)
++			return -EINVAL;
++		if (parameters == NULL)
++			return 0;
++		spa_pod_parser_pod(&parser, parameters);
++		if (spa_pod_parser_push_struct(&parser, &frame) < 0)
++			return -EINVAL;
++		while (spa_pod_parser_current(&parser) != NULL) {
++			const char *key;
++			struct spa_pod *value_pod;
++			int32_t value;
++			if (spa_pod_parser_get_string(&parser, &key) < 0)
++				return -EINVAL;
++			value_pod = spa_pod_parser_next(&parser);
++			if (value_pod == NULL)
++				return -EINVAL;
++			if (!spa_streq(key, PACKET_FRAMES_KEY) && !spa_streq(key, PACKET_TIME_KEY))
++				continue;
++			if (spa_pod_get_int(value_pod, &value) < 0)
++				return -EINVAL;
++			if (spa_streq(key, PACKET_FRAMES_KEY)) {
++				if (value < 0 || value > 15)
++					return -EINVAL;
++				next.packet_frames = value;
++			} else if (spa_streq(key, PACKET_TIME_KEY)) {
++				if (value != 0 && (value < 1000 || value > 40000))
++					return -EINVAL;
++				next.packet_time_us = value;
++			}
++		}
++	}
++	if (memcmp(props, &next, sizeof(next)) == 0)
++		return 0;
++	*props = next;
++	return 1;
++}
++
+ struct impl {
+ 	sbc_t sbc;
+ 
+@@ -26,6 +127,10 @@
+ 	size_t mtu;
+ 	int codesize;
+ 	int max_frames;
++	uint32_t packet_frames;
++	uint32_t packet_time_us;
++	uint32_t sample_rate;
++	int active_max_frames;
+ 
+ 	int min_bitpool;
+ 	int max_bitpool;
+@@ -339,6 +444,15 @@
+ 	return this->sbc.bitpool;
+ }
+ 
++static int codec_update_props(void *data, void *properties)
++{
++	struct impl *this = data;
++	const struct sbc_packet_props *props = properties;
++	this->packet_frames = props->packet_frames;
++	this->packet_time_us = props->packet_time_us;
++	return 0;
++}
++
+ static int codec_enum_config(const struct media_codec *codec, uint32_t flags,
+ 		const void *caps, size_t caps_size, uint32_t id, uint32_t idx,
+ 		struct spa_pod_builder *b, struct spa_pod **param)
+@@ -394,15 +508,28 @@
+ 	a2dp_sbc_t *conf = config;
+ 	int res;
+ 
++	if (config == NULL || config_len < sizeof(*conf) ||
++			mtu <= sizeof(struct rtp_header) + sizeof(struct rtp_payload)) {
++		errno = EINVAL;
++		return NULL;
++	}
++
+ 	this = calloc(1, sizeof(struct impl));
+ 	if (this == NULL) {
+ 		res = -errno;
+ 		goto error;
+ 	}
+ 
+-	sbc_init(&this->sbc, 0);
++	if ((res = sbc_init(&this->sbc, 0)) < 0) {
++		free(this);
++		errno = -res;
++		return NULL;
++	}
+ 	this->sbc.endian = SBC_LE;
+ 	this->mtu = mtu;
++	if (props != NULL)
++		codec_update_props(this, props);
++	this->sample_rate = info->info.raw.rate;
+ 
+ 	if (info->media_type != SPA_MEDIA_TYPE_audio ||
+ 	    info->media_subtype != SPA_MEDIA_SUBTYPE_raw ||
+@@ -488,9 +615,17 @@
+ 	this->max_bitpool = conf->max_bitpool;
+ 
+ 	codec_set_bitpool(this, conf->max_bitpool);
++	if (this->max_frames < 1) {
++		res = -EMSGSIZE;
++		goto error;
++	}
+ 
+ 	return this;
+ error:
++	if (this != NULL) {
++		sbc_finish(&this->sbc);
++		free(this);
++	}
+ 	errno = -res;
+ 	return NULL;
+ }
+@@ -511,6 +646,20 @@
+ 		void *dst, size_t dst_size, uint16_t seqnum, uint32_t timestamp)
+ {
+ 	struct impl *this = data;
++	const size_t header_size = sizeof(struct rtp_header) + sizeof(struct rtp_payload);
++
++	if (dst_size < header_size)
++		return -ENOSPC;
++	this->active_max_frames = this->max_frames;
++	if (this->packet_frames > 0)
++		this->active_max_frames = SPA_MIN(this->active_max_frames, (int)this->packet_frames);
++	if (this->packet_time_us > 0) {
++		uint32_t samples_per_frame = this->codesize /
++				(this->sbc.mode == SBC_MODE_MONO ? 2 : 4);
++		uint32_t budget = (uint64_t)this->packet_time_us * this->sample_rate /
++				(1000000u * samples_per_frame);
++		this->active_max_frames = SPA_MIN(this->active_max_frames, (int)SPA_MAX(budget, 1u));
++	}
+ 
+ 	this->header = (struct rtp_header *)dst;
+ 	this->payload = SPA_PTROFF(dst, sizeof(struct rtp_header), struct rtp_payload);
+@@ -531,17 +680,30 @@
+ 		size_t *dst_out, int *need_flush)
+ {
+ 	struct impl *this = data;
+-	int res;
++	ssize_t written = 0;
++	ssize_t consumed;
+ 
+-	res = sbc_encode(&this->sbc, src, src_size,
+-			dst, dst_size, (ssize_t*)dst_out);
+-	if (SPA_UNLIKELY(res < 0))
++	*dst_out = 0;
++	*need_flush = NEED_FLUSH_NO;
++	if (this->payload == NULL || this->payload->frame_count >= this->active_max_frames)
++		return -EINVAL;
++	if (src_size < (size_t)this->codesize)
+ 		return -EINVAL;
+-	spa_assert(res == this->codesize);
++	if (dst_size < sbc_get_frame_length(&this->sbc))
++		return -ENOSPC;
+ 
+-	this->payload->frame_count += res / this->codesize;
+-	*need_flush = (this->payload->frame_count >= this->max_frames) ? NEED_FLUSH_ALL : NEED_FLUSH_NO;
+-	return res;
++	consumed = sbc_encode(&this->sbc, src, this->codesize, dst, dst_size, &written);
++	if (consumed < 0)
++		return consumed;
++	if (consumed != this->codesize || written <= 0 || (size_t)written > dst_size)
++		return -EIO;
++
++	*dst_out = written;
++	++this->payload->frame_count;
++	/* Flush a complete RTP packet immediately at the selected frame budget. */
++	if (this->payload->frame_count == this->active_max_frames)
++		*need_flush = NEED_FLUSH_ALL;
++	return consumed;
+ }
+ 
+ static int codec_start_decode (void *data,
+@@ -590,6 +752,11 @@
+ 	.codec_id = A2DP_CODEC_SBC,
+ 	.name = "sbc",
+ 	.description = "SBC",
++	.init_props = codec_init_props,
++	.clear_props = free,
++	.enum_props = codec_enum_props,
++	.set_props = codec_set_props,
++	.update_props = codec_update_props,
+ 	.fill_caps = codec_fill_caps,
+ 	.select_config = codec_select_config,
+ 	.enum_config = codec_enum_config,
+@@ -614,6 +781,11 @@
+ 	.codec_id = A2DP_CODEC_SBC,
+ 	.name = "sbc_xq",
+ 	.description = "SBC-XQ",
++	.init_props = codec_init_props,
++	.clear_props = free,
++	.enum_props = codec_enum_props,
++	.set_props = codec_set_props,
++	.update_props = codec_update_props,
+ 	.endpoint_name = "sbc",
+ 	.fill_caps = NULL,
+ 	.select_config = codec_select_config,
